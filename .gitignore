@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+output/
+*.pyc
+
+# Large binary assets
+assets/
+*.rar
+*.vox
