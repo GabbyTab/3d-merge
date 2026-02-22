@@ -33,7 +33,7 @@ def to_uint8(grid: np.ndarray) -> np.ndarray:
 
 
 def default_sigmas(n_levels: int = 5) -> list[float]:
-    """Return a default σ schedule: doubling from 0.25.
+    """Return a σ schedule: doubling from 0.25.
 
     Produces n_levels+1 values (including σ=0 for the original).
     Example (n_levels=5):  [0, 0.25, 0.5, 1.0, 2.0, 4.0]
@@ -44,6 +44,23 @@ def default_sigmas(n_levels: int = 5) -> list[float]:
         sigmas.append(s)
         s *= 2.0
     return sigmas
+
+
+def auto_sigmas(grid_shape: tuple[int, ...],
+                target_coverage: float = 0.4) -> list[float]:
+    """Choose a σ schedule so the coarsest level covers ~target_coverage
+    of the grid's longest axis.
+
+    Rule: we need sigma_max * 4 ≈ max_dim * target_coverage,
+    then n_levels = ceil(log2(sigma_max / 0.25)).
+
+    Returns (sigmas, n_levels).
+    """
+    import math
+    max_dim = max(grid_shape[:3])
+    sigma_max = max(max_dim * target_coverage / 4.0, 1.0)
+    n_levels = max(int(math.ceil(math.log2(sigma_max / 0.25))), 3)
+    return default_sigmas(n_levels)
 
 
 # ── 3-D blur ────────────────────────────────────────────────────────────────

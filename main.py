@@ -35,6 +35,7 @@ from laplacian3d import (
     build_laplacian_stack as build_laplacian_stack_3d,
     reconstruct_from_stack as reconstruct_3d,
     default_sigmas,
+    auto_sigmas,
     to_float,
     to_uint8,
 )
@@ -150,7 +151,7 @@ def run_laplacian_3d(grid: np.ndarray, info: dict,
 
 def run_blend(grid_a: np.ndarray, info_a: dict,
               grid_b: np.ndarray, info_b: dict,
-              sigmas: list[float],
+              sigmas: list[float] | None,
               blend_axis: int,
               elev: float, azim: float,
               upsample_factor: int = 1,
@@ -166,7 +167,7 @@ def run_blend(grid_a: np.ndarray, info_a: dict,
 
     print(f"\n{'='*60}")
     print(f" Multiresolution blend: {label_a} + {label_b}")
-    print(f"   split axis={axis_name}, {len(sigmas)-1} levels")
+    print(f"   split axis={axis_name}")
     if upsample_factor > 1:
         print(f"   upsample {upsample_factor}x: "
               f"{grid_a.shape[:3]} -> "
@@ -197,6 +198,17 @@ def run_blend(grid_a: np.ndarray, info_a: dict,
             grid_a = upsample_nn(grid_a, upsample_factor)
             grid_b = upsample_nn(grid_b, upsample_factor)
             print(f"  nn-upsampled to {grid_a.shape[:3]}")
+
+    # ── Auto-scale sigmas and shape_sigma if not explicitly set ──────────
+    if sigmas is None:
+        sigmas = auto_sigmas(grid_a.shape)
+        print(f"  auto sigmas ({len(sigmas)-1} levels): "
+              f"{[f'{s:.1f}' for s in sigmas]}")
+    if shape_sigma is None:
+        max_dim = max(grid_a.shape[:3])
+        shape_sigma = max(max_dim * 0.05, 1.5)
+        print(f"  auto shape_sigma: {shape_sigma:.1f}  "
+              f"(5% of max dim {max_dim})")
 
     # Build the mask
     spatial = grid_a.shape[:3]
@@ -284,8 +296,9 @@ def main():
                         help="asset names for stacks (case-insensitive)")
     parser.add_argument("--all", action="store_true",
                         help="process every asset for stacks")
-    parser.add_argument("--levels", type=int, default=5,
-                        help="number of Laplacian detail levels (default 5)")
+    parser.add_argument("--levels", type=int, default=None,
+                        help="number of Laplacian detail levels "
+                             "(default: auto-scaled to grid size)")
     parser.add_argument("--axis", type=int, default=1,
                         help="slicing axis for 2D stack montage (0=X,1=Y,2=Z)")
     parser.add_argument("--elev", type=float, default=DEFAULT_ELEV,
@@ -314,12 +327,15 @@ def main():
                         help="open interactive pyvista viewer after blending")
     args = parser.parse_args()
 
-    sigmas = default_sigmas(args.levels)
+    sigmas = default_sigmas(args.levels) if args.levels is not None else None
 
     print("=" * 60)
     print(" 3-D Voxel Merge – Laplacian stacks & blending")
     print(f"   camera: elev={args.elev}  azim={args.azim}")
-    print(f"   levels: {args.levels}  σ: {[f'{s:.2f}' for s in sigmas]}")
+    if sigmas is not None:
+        print(f"   levels: {args.levels}  σ: {[f'{s:.2f}' for s in sigmas]}")
+    else:
+        print(f"   levels: auto (will scale to grid size)")
     if args.upsample > 1:
         print(f"   upsample: {args.upsample}x")
     print(f"   alpha threshold: {args.alpha_thresh}")
@@ -334,8 +350,9 @@ def main():
             grid, info = load_voxel_obj(path)
             inspect_grid(grid, info)
             run_renders(grid, info, elev=args.elev, azim=args.azim)
-            run_laplacian_2d(grid, info, sigmas, axis=args.axis)
-            run_laplacian_3d(grid, info, sigmas,
+            stack_sigmas = sigmas if sigmas is not None else auto_sigmas(grid.shape)
+            run_laplacian_2d(grid, info, stack_sigmas, axis=args.axis)
+            run_laplacian_3d(grid, info, stack_sigmas,
                              elev=args.elev, azim=args.azim)
 
     # ── Part 3: Multiresolution blend ─────────────────────────────────────
