@@ -111,24 +111,30 @@ def multiresolution_blend(grid_a: np.ndarray,
                           sigmas: list[float] | None = None,
                           n_levels: int = 5,
                           alpha_threshold: float = 0.5,
+                          shape_sigma: float | None = None,
                           ) -> tuple[np.ndarray, dict]:
     """Blend two voxel volumes using multiresolution blending.
 
-    Shape and colour are blended separately:
-      - **Colour** (RGB) goes through the full Laplacian multiresolution
-        pipeline for a seamless frequency-aware transition.
-      - **Shape** (alpha / occupancy) is blended directly using the most-
-        blurred mask level, then thresholded.  This prevents the Gaussian
-        blur in the Laplacian stack from inflating the shape far beyond
-        the original volumes.
+    Shape and colour each get their own Gaussian treatment:
+
+      - **Shape** (occupancy): each object's binary mask is Gaussian-
+        blurred at ``shape_sigma`` to create a smooth opacity field.
+        These are blended with a mask blurred at the same sigma, then
+        thresholded at ``alpha_threshold``.  ``shape_sigma`` controls
+        how rounded the morphed shape boundary is.
+      - **Colour** (RGB): full Laplacian multiresolution pipeline for
+        seamless frequency-aware colour transitions.
 
     Parameters
     ----------
     grid_a, grid_b : (X, Y, Z, 4) uint8 RGBA volumes (same shape)
     mask : (X, Y, Z) float32 in [0, 1].  1 = take from A, 0 = take from B.
-    sigmas : σ schedule, or None for default
+    sigmas : σ schedule for colour blending, or None for default
     n_levels : used only when sigmas is None
-    alpha_threshold : controls the blended shape boundary.
+    alpha_threshold : opacity below this → invisible (cleans noise)
+    shape_sigma : Gaussian σ for shape blending.  Controls how smooth
+                  the shape morph is.  None → use sigmas[-1] (coarsest
+                  colour sigma).
 
     Returns
     -------
@@ -142,65 +148,78 @@ def multiresolution_blend(grid_a: np.ndarray,
 
     if sigmas is None:
         sigmas = default_sigmas(n_levels)
+    if shape_sigma is None:
+        shape_sigma = min(sigmas[-1], 1.5)
 
     vol_a = to_float(grid_a)
     vol_b = to_float(grid_b)
 
-    # ── Shape blending (alpha channel) ────────────────────────────────────
-    # Blend occupancy directly with the most-blurred mask.  This keeps the
-    # shape close to the union of both inputs instead of inflating it.
-    shape_a = (vol_a[..., 3] > 0).astype(np.float32)
-    shape_b = (vol_b[..., 3] > 0).astype(np.float32)
-    mask_coarse = gaussian_filter(mask, sigma=sigmas[-1])
-    blended_shape = mask_coarse * shape_a + (1 - mask_coarse) * shape_b
-    solid_mask = blended_shape >= alpha_threshold
+    # ── Shape blending ────────────────────────────────────────────────────
+    # Each object's binary occupancy is Gaussian-blurred to create a smooth
+    # opacity field (like a soft distance field).  The mask is blurred at
+    # the same sigma.  The blend then smoothly morphs one shape into the
+    # other, and thresholding carves out the final surface.
+    binary_a = (vol_a[..., 3] > 0).astype(np.float32)
+    binary_b = (vol_b[..., 3] > 0).astype(np.float32)
 
-    # ── Colour blending (RGB channels only) ───────────────────────────────
-    # Build RGB-only volumes (3 channels), using the Laplacian pipeline
+    opacity_a = gaussian_filter(binary_a, sigma=shape_sigma)
+    opacity_b = gaussian_filter(binary_b, sigma=shape_sigma)
+    mask_shape = gaussian_filter(mask, sigma=shape_sigma)
+
+    blended_opacity = mask_shape * opacity_a + (1 - mask_shape) * opacity_b
+    solid_mask = blended_opacity >= alpha_threshold
+
+    # ── Colour blending (RGB, Laplacian multiresolution) ──────────────────
+    # Before blurring, extend each object's colours outward into the void
+    # using nearest-neighbour propagation.  This way the Gaussian blur
+    # only ever mixes real colours, never the black (0,0,0) void.
     rgb_a = vol_a[..., :3]
     rgb_b = vol_b[..., :3]
 
-    # Build Laplacian stacks for RGB
-    from laplacian3d import blur3d
-    def _build_rgb_stack(rgb, sigmas):
-        G = [blur3d(np.concatenate([rgb, np.ones(rgb.shape[:3]+(1,), dtype=np.float32)], axis=-1), s)[..., :3]
-             if s > 0 else rgb.copy()
-             for s in sigmas]
-        # Actually, just blur RGB directly
-        G2 = []
+    def _extend_colors(rgb, alpha):
+        """Fill empty voxels with the nearest filled voxel's colour."""
+        from scipy.ndimage import distance_transform_edt
+        mask = alpha > 0
+        if mask.all():
+            return rgb.copy()
+        _, indices = distance_transform_edt(~mask, return_indices=True)
+        extended = rgb[indices[0], indices[1], indices[2]]
+        return extended
+
+    rgb_a_ext = _extend_colors(rgb_a, vol_a[..., 3])
+    rgb_b_ext = _extend_colors(rgb_b, vol_b[..., 3])
+
+    def _build_rgb_laplacian(rgb, sigmas):
+        G = []
         for s in sigmas:
             if s <= 0:
-                G2.append(rgb.copy())
+                G.append(rgb.copy())
             else:
                 out = np.empty_like(rgb)
                 for c in range(3):
                     out[..., c] = gaussian_filter(rgb[..., c], sigma=s)
-                G2.append(out)
-        L = [G2[i] - G2[i+1] for i in range(len(G2)-1)]
-        return L, G2[-1], G2
+                G.append(out)
+        L = [G[i] - G[i + 1] for i in range(len(G) - 1)]
+        return L, G[-1]
 
-    L_a, res_a_rgb, _ = _build_rgb_stack(rgb_a, sigmas)
-    L_b, res_b_rgb, _ = _build_rgb_stack(rgb_b, sigmas)
+    L_a, res_a_rgb = _build_rgb_laplacian(rgb_a_ext, sigmas)
+    L_b, res_b_rgb = _build_rgb_laplacian(rgb_b_ext, sigmas)
 
-    # Build Gaussian stack of the mask
     M_G = build_mask_gaussian_stack(mask, sigmas)
 
-    # Blend each Laplacian level (RGB only)
     L_blend = []
     for i in range(len(L_a)):
-        m = M_G[i][..., None]  # (X, Y, Z, 1)
+        m = M_G[i][..., None]
         L_blend.append(m * L_a[i] + (1 - m) * L_b[i])
 
-    # Blend residual
     m_last = M_G[-1][..., None]
     res_blend_rgb = m_last * res_a_rgb + (1 - m_last) * res_b_rgb
 
-    # Reconstruct RGB
     rgb_result = res_blend_rgb.copy()
-    for L in L_blend:
-        rgb_result = rgb_result + L
+    for lap in L_blend:
+        rgb_result = rgb_result + lap
 
-    # ── Combine: blended RGB + blended shape ──────────────────────────────
+    # ── Combine ───────────────────────────────────────────────────────────
     result_float = np.zeros((*vol_a.shape[:3], 4), dtype=np.float32)
     result_float[..., :3] = np.clip(rgb_result, 0, 1)
     result_float[solid_mask, 3] = 1.0
@@ -208,19 +227,18 @@ def multiresolution_blend(grid_a: np.ndarray,
 
     result = to_uint8(result_float)
 
-    # Build details dict for visualisation (wrap RGB layers as RGBA)
     def _rgb_to_rgba(rgb_layer):
         alpha = np.ones(rgb_layer.shape[:3] + (1,), dtype=np.float32)
         return np.concatenate([rgb_layer, alpha], axis=-1)
 
-    L_a_rgba = [_rgb_to_rgba(l) for l in L_a]
-    L_b_rgba = [_rgb_to_rgba(l) for l in L_b]
-    L_blend_rgba = [_rgb_to_rgba(l) for l in L_blend]
-
     details = {
         "sigmas": sigmas,
+        "shape_sigma": shape_sigma,
         "mask_stack": M_G,
-        "L_a": L_a_rgba, "L_b": L_b_rgba, "L_blend": L_blend_rgba,
+        "blended_opacity": blended_opacity,
+        "L_a": [_rgb_to_rgba(l) for l in L_a],
+        "L_b": [_rgb_to_rgba(l) for l in L_b],
+        "L_blend": [_rgb_to_rgba(l) for l in L_blend],
         "res_a": _rgb_to_rgba(res_a_rgb),
         "res_b": _rgb_to_rgba(res_b_rgb),
         "res_blend": _rgb_to_rgba(res_blend_rgb),

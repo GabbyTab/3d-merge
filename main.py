@@ -155,6 +155,7 @@ def run_blend(grid_a: np.ndarray, info_a: dict,
               elev: float, azim: float,
               upsample_factor: int = 1,
               alpha_threshold: float = 0.5,
+              shape_sigma: float | None = None,
               smooth: bool = False,
               save_npy: bool = True) -> np.ndarray:
     """Run the full blend pipeline and return the result grid."""
@@ -217,6 +218,7 @@ def run_blend(grid_a: np.ndarray, info_a: dict,
     result, details = multiresolution_blend(
         grid_a, grid_b, mask, sigmas=sigmas,
         alpha_threshold=alpha_threshold,
+        shape_sigma=shape_sigma,
     )
     n_filled = int((result[..., 3] > 0).sum())
     print(f"\n  Multiresolution blend: {n_filled} filled voxels")
@@ -305,6 +307,9 @@ def main():
                              "(default: nearest-neighbour / blocky)")
     parser.add_argument("--alpha-thresh", type=float, default=0.5,
                         help="alpha threshold to remove ghost voxels (default 0.5)")
+    parser.add_argument("--shape-sigma", type=float, default=None,
+                        help="Gaussian sigma for shape blending (default: same "
+                             "as coarsest colour sigma). Larger = rounder morph.")
     parser.add_argument("--view", action="store_true",
                         help="open interactive pyvista viewer after blending")
     args = parser.parse_args()
@@ -343,6 +348,7 @@ def main():
         elev=args.elev, azim=args.azim,
         upsample_factor=args.upsample,
         alpha_threshold=args.alpha_thresh,
+        shape_sigma=args.shape_sigma,
         smooth=args.smooth,
     )
 

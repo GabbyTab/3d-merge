@@ -156,10 +156,8 @@ def upsample_smooth(grid: np.ndarray, factor: int = 4,
                      alpha_threshold: float = 0.5) -> np.ndarray:
     """Smooth (trilinear) upsample that rounds off blocky edges.
 
-    Uses scipy.ndimage.zoom with order=1 (trilinear interpolation) on
-    each RGBA channel.  The interpolation creates smooth gradients at
-    voxel boundaries.  After interpolation, voxels with alpha above
-    ``alpha_threshold`` are snapped to fully opaque; the rest are cleared.
+    Uses premultiplied-alpha interpolation so that colours near the
+    surface aren't darkened by mixing with the black (0,0,0) void.
 
     Parameters
     ----------
@@ -174,16 +172,30 @@ def upsample_smooth(grid: np.ndarray, factor: int = 4,
     """
     from scipy.ndimage import zoom
 
-    # Interpolate in float space
     vol = grid.astype(np.float32) / 255.0
-    zoomed = zoom(vol, [factor, factor, factor, 1], order=1)
+    zf = [factor, factor, factor, 1]
+
+    # Premultiplied-alpha interpolation:
+    # Interpolate (RGB * alpha) and (alpha) separately, then divide.
+    # This prevents the black void from bleeding into edge colours.
+    alpha = vol[..., 3:4]
+    premult = vol[..., :3] * alpha
+
+    alpha_up = zoom(alpha, zf, order=1)
+    premult_up = zoom(premult, zf, order=1)
+
+    # Recover RGB by dividing out alpha (avoid divide-by-zero)
+    safe_alpha = np.maximum(alpha_up, 1e-6)
+    rgb_up = premult_up / safe_alpha
 
     # Threshold alpha to carve the smooth surface
-    solid = zoomed[..., 3] >= alpha_threshold
-    zoomed[~solid] = 0.0
-    zoomed[solid, 3] = 1.0  # snap to fully opaque
+    solid = alpha_up[..., 0] >= alpha_threshold
 
-    return np.clip(zoomed * 255, 0, 255).astype(np.uint8)
+    out = np.zeros((*rgb_up.shape[:3], 4), dtype=np.float32)
+    out[solid, :3] = np.clip(rgb_up[solid], 0, 1)
+    out[solid, 3] = 1.0
+
+    return np.clip(out * 255, 0, 255).astype(np.uint8)
 
 
 def fill_interior(grid: np.ndarray) -> np.ndarray:
